@@ -9,6 +9,7 @@ A GUI tool for:
 Requirements: Pillow  (pip install pillow)
 """
 
+import math
 import os
 import json
 import shutil
@@ -24,6 +25,7 @@ SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp")
 DEFAULT_CLASS = "number_plate"
 CANVAS_MAX_W = 700
 CANVAS_MAX_H = 600
+ANGLE_EPSILON = 0.01   # degrees; below this an OBB angle is treated as zero
 
 YOLO_SIZES = [
     ("416 × 416 (YOLOv3/v4)", 416, 416),
@@ -73,6 +75,49 @@ def yolo_to_bbox(cx, cy, bw, bh, img_w, img_h):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# OBB helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def rotate_point(px, py, cx, cy, angle_deg):
+    """Rotate pixel (px, py) around centre (cx, cy) by angle_deg degrees."""
+    rad = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    dx, dy = px - cx, py - cy
+    return dx * cos_a - dy * sin_a + cx, dx * sin_a + dy * cos_a + cy
+
+
+def bbox_to_obb_corners(x1, y1, x2, y2, angle_deg=0.0):
+    """Return the 4 corners of an oriented bounding box (top-left → clockwise)."""
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    if angle_deg == 0.0:
+        return corners
+    return [rotate_point(px, py, cx, cy, angle_deg) for px, py in corners]
+
+
+def obb_corners_to_yolo(corners, img_w, img_h):
+    """Normalise 4 corner points for YOLO OBB format (8 floats)."""
+    flat = []
+    for px, py in corners:
+        flat.extend([px / img_w, py / img_h])
+    return flat
+
+
+def corners_to_bbox_angle(corners):
+    """Reconstruct axis-aligned bbox and rotation angle from 4 OBB corners."""
+    cx = sum(p[0] for p in corners) / 4
+    cy = sum(p[1] for p in corners) / 4
+    dx = corners[1][0] - corners[0][0]
+    dy = corners[1][1] - corners[0][1]
+    angle_deg = math.degrees(math.atan2(dy, dx))
+    unrotated = [rotate_point(px, py, cx, cy, -angle_deg) for px, py in corners]
+    x1 = min(p[0] for p in unrotated)
+    y1 = min(p[1] for p in unrotated)
+    x2 = max(p[0] for p in unrotated)
+    y2 = max(p[1] for p in unrotated)
+    return x1, y1, x2, y2, angle_deg
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main Application
 # ──────────────────────────────────────────────────────────────────────────────
 class ImageEditorApp(tk.Tk):
@@ -119,10 +164,14 @@ class ImageEditorApp(tk.Tk):
 
         # output settings
         self.output_dir: str = ""
-        self.export_mode = tk.StringVar(value="yolo")   # "yolo" | "cnn"
+        self.export_mode = tk.StringVar(value="yolo")   # "yolo" | "yolo_obb" | "cnn"
         self.resize_mode = tk.StringVar(value="none")   # "none" | preset key
         self.custom_w = tk.IntVar(value=640)
         self.custom_h = tk.IntVar(value=640)
+
+        # OBB (Oriented Bounding Box) state
+        self.obb_mode_var = tk.BooleanVar(value=False)
+        self.obb_angle_var = tk.DoubleVar(value=0.0)
 
         self._build_ui()
         self._bind_keys()
@@ -239,6 +288,19 @@ class ImageEditorApp(tk.Tk):
             anchor=tk.W, padx=6, pady=2
         )
 
+        ttk.Separator(ann_tab).pack(fill=tk.X, pady=6)
+        ttk.Label(ann_tab, text="OBB (Oriented Box):", foreground="#aaaaaa").pack(anchor=tk.W, padx=6)
+        ttk.Checkbutton(ann_tab, text="OBB Mode", variable=self.obb_mode_var).pack(
+            anchor=tk.W, padx=6, pady=2
+        )
+        angle_row = ttk.Frame(ann_tab)
+        angle_row.pack(anchor=tk.W, padx=6, pady=2)
+        ttk.Label(angle_row, text="Angle (°):").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            angle_row, from_=-180, to=180, increment=1,
+            textvariable=self.obb_angle_var, width=7,
+        ).pack(side=tk.LEFT, padx=4)
+
         # ── Tab 2: Transforms ─────────────────────────────────────────────
         tf_tab = ttk.Frame(notebook)
         notebook.add(tf_tab, text="Transforms")
@@ -295,6 +357,8 @@ class ImageEditorApp(tk.Tk):
         ttk.Label(exp_tab, text="Export Mode:", foreground="#aaaaaa").pack(anchor=tk.W, padx=6, pady=(8, 0))
         ttk.Radiobutton(exp_tab, text="YOLO  (images + .txt labels)",
                         variable=self.export_mode, value="yolo").pack(anchor=tk.W, padx=12)
+        ttk.Radiobutton(exp_tab, text="YOLO OBB  (images + .txt OBB labels)",
+                        variable=self.export_mode, value="yolo_obb").pack(anchor=tk.W, padx=12)
         ttk.Radiobutton(exp_tab, text="CNN   (images only, organised)",
                         variable=self.export_mode, value="cnn").pack(anchor=tk.W, padx=12)
 
@@ -488,12 +552,29 @@ class ImageEditorApp(tk.Tk):
             iw_orig, ih_orig = self.original_image.size
             for i, ann in enumerate(self.annotations[path]):
                 x1, y1, x2, y2 = ann["bbox"]
-                cx1, cy1 = image_to_canvas_coords(x1, y1, self.canvas_offset_x, self.canvas_offset_y, scale)
-                cx2, cy2 = image_to_canvas_coords(x2, y2, self.canvas_offset_x, self.canvas_offset_y, scale)
+                angle = ann.get("angle", 0.0)
                 color = "#00ff88"
-                self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=color, width=2, tags=f"box_{i}")
-                self.canvas.create_text(cx1 + 2, cy1 - 10, text=ann["class"],
-                                        fill=color, anchor=tk.W, font=("Helvetica", 9, "bold"))
+                tag = f"box_{i}"
+                if angle != 0.0:
+                    corners = bbox_to_obb_corners(x1, y1, x2, y2, angle)
+                    canvas_corners = [
+                        image_to_canvas_coords(px, py, self.canvas_offset_x, self.canvas_offset_y, scale)
+                        for px, py in corners
+                    ]
+                    flat = [coord for pt in canvas_corners for coord in pt]
+                    self.canvas.create_polygon(flat, outline=color, fill="", width=2, tags=tag)
+                    lx, ly = canvas_corners[0]
+                    self.canvas.create_text(
+                        lx + 2, ly - 10,
+                        text=f"{ann['class']} ({angle:.1f}°)",
+                        fill=color, anchor=tk.W, font=("Helvetica", 9, "bold"),
+                    )
+                else:
+                    cx1, cy1 = image_to_canvas_coords(x1, y1, self.canvas_offset_x, self.canvas_offset_y, scale)
+                    cx2, cy2 = image_to_canvas_coords(x2, y2, self.canvas_offset_x, self.canvas_offset_y, scale)
+                    self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=color, width=2, tags=tag)
+                    self.canvas.create_text(cx1 + 2, cy1 - 10, text=ann["class"],
+                                            fill=color, anchor=tk.W, font=("Helvetica", 9, "bold"))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Drawing bounding boxes
@@ -549,12 +630,23 @@ class ImageEditorApp(tk.Tk):
             self.annotations[path] = []
 
         cls = self.class_combo.get() or DEFAULT_CLASS
-        self.annotations[path].append({"class": cls, "bbox": [ix1, iy1, ix2, iy2]})
+        ann = {"class": cls, "bbox": [ix1, iy1, ix2, iy2]}
+        if self.obb_mode_var.get():
+            try:
+                angle = float(self.obb_angle_var.get())
+            except (ValueError, tk.TclError):
+                angle = 0.0
+            if angle != 0.0:
+                ann["angle"] = angle
+        self.annotations[path].append(ann)
         # track display_image dimensions so YOLO conversion uses the correct size
         self.annotation_img_sizes[path] = self.display_image.size
         self._update_box_listbox()
         self._refresh_canvas()
-        self.status_var.set(f"Box added → class '{cls}'  [{ix1:.0f},{iy1:.0f},{ix2:.0f},{iy2:.0f}]")
+        angle_info = f"  angle={ann.get('angle', 0.0):.1f}°" if "angle" in ann else ""
+        self.status_var.set(
+            f"Box added → class '{cls}'  [{ix1:.0f},{iy1:.0f},{ix2:.0f},{iy2:.0f}]{angle_info}"
+        )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Annotation management
@@ -570,8 +662,10 @@ class ImageEditorApp(tk.Tk):
         if path and path in self.annotations:
             for ann in self.annotations[path]:
                 x1, y1, x2, y2 = ann["bbox"]
+                angle = ann.get("angle", 0.0)
+                angle_str = f" ∠{angle:.1f}°" if angle != 0.0 else ""
                 self.box_listbox.insert(
-                    tk.END, f"[{ann['class']}] {x1:.0f},{y1:.0f} → {x2:.0f},{y2:.0f}"
+                    tk.END, f"[{ann['class']}]{angle_str} {x1:.0f},{y1:.0f} → {x2:.0f},{y2:.0f}"
                 )
 
     def _delete_selected_box(self):
@@ -632,8 +726,14 @@ class ImageEditorApp(tk.Tk):
             with open(txt_path, "w") as f:
                 for ann in anns:
                     cls_idx = self.class_list.index(ann["class"]) if ann["class"] in self.class_list else 0
-                    cx, cy, bw, bh = bbox_to_yolo(*ann["bbox"], iw, ih)
-                    f.write(f"{cls_idx} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+                    angle = ann.get("angle", 0.0)
+                    if angle != 0.0:
+                        corners = bbox_to_obb_corners(*ann["bbox"], angle)
+                        coords = obb_corners_to_yolo(corners, iw, ih)
+                        f.write(f"{cls_idx} " + " ".join(f"{v:.6f}" for v in coords) + "\n")
+                    else:
+                        cx, cy, bw, bh = bbox_to_yolo(*ann["bbox"], iw, ih)
+                        f.write(f"{cls_idx} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
             saved += 1
         # save class names file alongside first image
         if self.image_paths:
@@ -657,12 +757,25 @@ class ImageEditorApp(tk.Tk):
             with open(txt_path) as f:
                 for line in f:
                     parts = line.strip().split()
-                    if len(parts) != 5:
-                        continue
-                    cls_idx, cx, cy, bw, bh = int(parts[0]), *map(float, parts[1:])
-                    cls = self.class_list[cls_idx] if cls_idx < len(self.class_list) else str(cls_idx)
-                    x1, y1, x2, y2 = yolo_to_bbox(cx, cy, bw, bh, iw, ih)
-                    anns.append({"class": cls, "bbox": [x1, y1, x2, y2]})
+                    try:
+                        if len(parts) == 9:
+                            # YOLO OBB format: class x1 y1 x2 y2 x3 y3 x4 y4 (normalised)
+                            cls_idx = int(parts[0])
+                            coords = list(map(float, parts[1:]))
+                            corners = [(coords[i] * iw, coords[i + 1] * ih) for i in range(0, 8, 2)]
+                            x1, y1, x2, y2, angle_deg = corners_to_bbox_angle(corners)
+                            cls = self.class_list[cls_idx] if cls_idx < len(self.class_list) else str(cls_idx)
+                            ann = {"class": cls, "bbox": [x1, y1, x2, y2]}
+                            if abs(angle_deg) > ANGLE_EPSILON:
+                                ann["angle"] = angle_deg
+                            anns.append(ann)
+                        elif len(parts) == 5:
+                            cls_idx, cx, cy, bw, bh = int(parts[0]), *map(float, parts[1:])
+                            cls = self.class_list[cls_idx] if cls_idx < len(self.class_list) else str(cls_idx)
+                            x1, y1, x2, y2 = yolo_to_bbox(cx, cy, bw, bh, iw, ih)
+                            anns.append({"class": cls, "bbox": [x1, y1, x2, y2]})
+                    except (ValueError, IndexError):
+                        continue  # skip malformed lines
             self.annotations[path] = anns
             self._update_box_listbox()
             self._refresh_canvas()
@@ -701,7 +814,7 @@ class ImageEditorApp(tk.Tk):
         target_size = self._get_target_size()
         mode = self.export_mode.get()
 
-        if mode == "yolo":
+        if mode in ("yolo", "yolo_obb"):
             img_dir = os.path.join(self.output_dir, "images")
             lbl_dir = os.path.join(self.output_dir, "labels")
             os.makedirs(img_dir, exist_ok=True)
@@ -740,8 +853,8 @@ class ImageEditorApp(tk.Tk):
                 out_img = os.path.join(img_dir, name + ".jpg")
                 img.save(out_img, "JPEG", quality=95)
 
-                # write YOLO labels
-                if mode == "yolo" and path in self.annotations and self.annotations[path]:
+                # write YOLO / YOLO OBB labels
+                if mode in ("yolo", "yolo_obb") and path in self.annotations and self.annotations[path]:
                     iw_new, ih_new = img.size
                     out_txt = os.path.join(lbl_dir, name + ".txt")
                     # scale from annotation space (display dimensions) to exported dimensions
@@ -760,15 +873,28 @@ class ImageEditorApp(tk.Tk):
                                 if ann["class"] in self.class_list
                                 else 0
                             )
-                            cx, cy, bw, bh = bbox_to_yolo(x1, y1, x2, y2, iw_new, ih_new)
-                            f.write(f"{cls_idx} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+                            angle = ann.get("angle", 0.0)
+                            if mode == "yolo_obb":
+                                # Always write 9-value OBB format
+                                corners = bbox_to_obb_corners(x1, y1, x2, y2, angle)
+                                coords = obb_corners_to_yolo(corners, iw_new, ih_new)
+                                f.write(f"{cls_idx} " + " ".join(f"{v:.6f}" for v in coords) + "\n")
+                            else:
+                                if angle != 0.0:
+                                    # Mixed: write OBB format for rotated annotations
+                                    corners = bbox_to_obb_corners(x1, y1, x2, y2, angle)
+                                    coords = obb_corners_to_yolo(corners, iw_new, ih_new)
+                                    f.write(f"{cls_idx} " + " ".join(f"{v:.6f}" for v in coords) + "\n")
+                                else:
+                                    cx, cy, bw, bh = bbox_to_yolo(x1, y1, x2, y2, iw_new, ih_new)
+                                    f.write(f"{cls_idx} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
 
                 exported += 1
             except Exception as exc:
                 errors.append(f"{os.path.basename(path)}: {exc}")
 
         # write classes.txt
-        if mode == "yolo":
+        if mode in ("yolo", "yolo_obb"):
             with open(os.path.join(self.output_dir, "classes.txt"), "w") as f:
                 f.write("\n".join(self.class_list))
 
