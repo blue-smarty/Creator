@@ -97,6 +97,9 @@ class ImageEditorApp(tk.Tk):
 
         # annotations: dict[path] → list of {"class": str, "bbox": [x1,y1,x2,y2]}
         self.annotations: dict[str, list] = {}
+        # dimensions of the display_image when annotations were drawn (may differ
+        # from original due to rotation with expand=True)
+        self.annotation_img_sizes: dict[str, tuple[int, int]] = {}
         self.class_list: list[str] = [DEFAULT_CLASS]
 
         # drawing state
@@ -547,6 +550,8 @@ class ImageEditorApp(tk.Tk):
 
         cls = self.class_combo.get() or DEFAULT_CLASS
         self.annotations[path].append({"class": cls, "bbox": [ix1, iy1, ix2, iy2]})
+        # track display_image dimensions so YOLO conversion uses the correct size
+        self.annotation_img_sizes[path] = self.display_image.size
         self._update_box_listbox()
         self._refresh_canvas()
         self.status_var.set(f"Box added → class '{cls}'  [{ix1:.0f},{iy1:.0f},{ix2:.0f},{iy2:.0f}]")
@@ -615,8 +620,12 @@ class ImageEditorApp(tk.Tk):
             if not anns:
                 continue
             try:
-                img = Image.open(path)
-                iw, ih = img.size
+                # use display dimensions (may differ from original if rotation was applied)
+                if path in self.annotation_img_sizes:
+                    iw, ih = self.annotation_img_sizes[path]
+                else:
+                    img = Image.open(path)
+                    iw, ih = img.size
             except Exception:
                 continue
             txt_path = os.path.splitext(path)[0] + ".txt"
@@ -735,13 +744,17 @@ class ImageEditorApp(tk.Tk):
                 if mode == "yolo" and path in self.annotations and self.annotations[path]:
                     iw_new, ih_new = img.size
                     out_txt = os.path.join(lbl_dir, name + ".txt")
-                    scale_x = iw_new / iw_orig
-                    scale_y = ih_new / ih_orig
+                    # scale from annotation space (display dimensions) to exported dimensions
+                    ann_w, ann_h = self.annotation_img_sizes.get(path, (iw_orig, ih_orig))
+                    scale_x = iw_new / ann_w
+                    scale_y = ih_new / ann_h
                     with open(out_txt, "w") as f:
                         for ann in self.annotations[path]:
                             x1, y1, x2, y2 = ann["bbox"]
-                            x1 *= scale_x; x2 *= scale_x
-                            y1 *= scale_y; y2 *= scale_y
+                            x1 *= scale_x
+                            x2 *= scale_x
+                            y1 *= scale_y
+                            y2 *= scale_y
                             cls_idx = (
                                 self.class_list.index(ann["class"])
                                 if ann["class"] in self.class_list
