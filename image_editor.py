@@ -175,7 +175,7 @@ class ImageEditorApp(tk.Tk):
         self.obb_angle_var = tk.DoubleVar(value=0.0)
 
         # Train/Val/Test split state
-        self.split_var = tk.BooleanVar(value=True)
+        self.split_var = tk.BooleanVar(value=False)
         self.split_train = tk.IntVar(value=70)
         self.split_val = tk.IntVar(value=20)
         self.split_test = tk.IntVar(value=10)
@@ -869,14 +869,13 @@ class ImageEditorApp(tk.Tk):
                 os.makedirs(os.path.join(self.output_dir, split, "labels"), exist_ok=True)
         else:
             split_map = {}
+            img_dir = os.path.join(self.output_dir, "images")
+            os.makedirs(img_dir, exist_ok=True)
             if mode in ("yolo", "yolo_obb"):
-                img_dir = os.path.join(self.output_dir, "images")
                 lbl_dir = os.path.join(self.output_dir, "labels")
-                os.makedirs(img_dir, exist_ok=True)
                 os.makedirs(lbl_dir, exist_ok=True)
             else:
-                img_dir = os.path.join(self.output_dir, "images")
-                os.makedirs(img_dir, exist_ok=True)
+                lbl_dir = img_dir  # unused for CNN, but keeps reference well-defined
 
         exported = 0
         errors = []
@@ -908,12 +907,13 @@ class ImageEditorApp(tk.Tk):
 
                 # Resolve destination directories
                 if use_split:
+                    # All paths are assigned during split; fallback to "train" is defensive only
                     split_name = split_map.get(path, "train")
                     cur_img_dir = os.path.join(self.output_dir, split_name, "images")
                     cur_lbl_dir = os.path.join(self.output_dir, split_name, "labels")
                 else:
                     cur_img_dir = img_dir
-                    cur_lbl_dir = lbl_dir if mode in ("yolo", "yolo_obb") else img_dir
+                    cur_lbl_dir = lbl_dir
 
                 out_img = os.path.join(cur_img_dir, name + ".jpg")
                 img.save(out_img, "JPEG", quality=95)
@@ -1041,9 +1041,12 @@ class ImageEditorApp(tk.Tk):
             count = 0
             for result in results:
                 for box in result.boxes:
-                    cls_id = int(box.cls[0])
-                    cls_name = model.names[cls_id]
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    try:
+                        cls_id = int(box.cls[0])
+                        cls_name = model.names[cls_id]
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    except (IndexError, KeyError, ValueError):
+                        continue
                     self.annotations[path].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
                     if cls_name not in self.class_list:
                         self.class_list.append(cls_name)
@@ -1095,9 +1098,12 @@ class ImageEditorApp(tk.Tk):
 
                 for result in results:
                     for box in result.boxes:
-                        cls_id = int(box.cls[0])
-                        cls_name = model.names[cls_id]
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        try:
+                            cls_id = int(box.cls[0])
+                            cls_name = model.names[cls_id]
+                            x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        except (IndexError, KeyError, ValueError):
+                            continue
                         self.annotations[path].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
                         if cls_name not in self.class_list:
                             self.class_list.append(cls_name)
