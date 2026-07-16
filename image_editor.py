@@ -11,6 +11,7 @@ Requirements: Pillow  (pip install pillow)
 
 import math
 import os
+import random
 import json
 import shutil
 import tkinter as tk
@@ -173,6 +174,12 @@ class ImageEditorApp(tk.Tk):
         self.obb_mode_var = tk.BooleanVar(value=False)
         self.obb_angle_var = tk.DoubleVar(value=0.0)
 
+        # Train/Val/Test split state
+        self.split_var = tk.BooleanVar(value=True)
+        self.split_train = tk.IntVar(value=70)
+        self.split_val = tk.IntVar(value=20)
+        self.split_test = tk.IntVar(value=10)
+
         self._build_ui()
         self._bind_keys()
 
@@ -206,6 +213,9 @@ class ImageEditorApp(tk.Tk):
         ttk.Button(toolbar, text="💾 Save Annotations", command=self.save_annotations).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="📤 Batch Export", command=self.batch_export).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="🗑 Clear Boxes", command=self.clear_boxes).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(toolbar, text="🤖 Auto-Annotate", command=self.auto_annotate).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="🤖 Auto-Annotate All", command=self.auto_annotate_all).pack(side=tk.LEFT, padx=2)
 
         # ── Main area ──────────────────────────────────────────────────────
         main = ttk.Frame(self)
@@ -381,6 +391,19 @@ class ImageEditorApp(tk.Tk):
         ttk.Entry(custom_row, textvariable=self.custom_w, width=5).pack(side=tk.LEFT)
         ttk.Label(custom_row, text="×").pack(side=tk.LEFT)
         ttk.Entry(custom_row, textvariable=self.custom_h, width=5).pack(side=tk.LEFT)
+
+        ttk.Separator(exp_tab).pack(fill=tk.X, pady=6)
+        ttk.Label(exp_tab, text="Train/Val/Test Split:", foreground="#aaaaaa").pack(anchor=tk.W, padx=6)
+        ttk.Checkbutton(exp_tab, text="Split into train/val/test",
+                        variable=self.split_var).pack(anchor=tk.W, padx=12, pady=(2, 0))
+        split_row = ttk.Frame(exp_tab)
+        split_row.pack(anchor=tk.W, padx=12, pady=2)
+        ttk.Label(split_row, text="Train %:").pack(side=tk.LEFT)
+        ttk.Spinbox(split_row, from_=1, to=98, textvariable=self.split_train, width=4).pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(split_row, text="Val %:").pack(side=tk.LEFT)
+        ttk.Spinbox(split_row, from_=1, to=98, textvariable=self.split_val, width=4).pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(split_row, text="Test %:").pack(side=tk.LEFT)
+        ttk.Spinbox(split_row, from_=0, to=98, textvariable=self.split_test, width=4).pack(side=tk.LEFT, padx=(2, 0))
 
         ttk.Separator(exp_tab).pack(fill=tk.X, pady=6)
         dir_row = ttk.Frame(exp_tab)
@@ -813,15 +836,47 @@ class ImageEditorApp(tk.Tk):
 
         target_size = self._get_target_size()
         mode = self.export_mode.get()
+        use_split = self.split_var.get() and mode in ("yolo", "yolo_obb")
 
-        if mode in ("yolo", "yolo_obb"):
-            img_dir = os.path.join(self.output_dir, "images")
-            lbl_dir = os.path.join(self.output_dir, "labels")
-            os.makedirs(img_dir, exist_ok=True)
-            os.makedirs(lbl_dir, exist_ok=True)
+        if use_split:
+            # Validate split ratios
+            train_pct = self.split_train.get()
+            val_pct = self.split_val.get()
+            test_pct = self.split_test.get()
+            if train_pct + val_pct + test_pct != 100:
+                messagebox.showerror(
+                    "Invalid split",
+                    f"Train + Val + Test must sum to 100 (currently {train_pct + val_pct + test_pct}).",
+                )
+                return
+
+            # Shuffle and split image paths
+            shuffled = list(self.image_paths)
+            random.shuffle(shuffled)
+            n = len(shuffled)
+            n_train = int(n * train_pct / 100)
+            n_val = int(n * val_pct / 100)
+            split_map: dict[str, str] = {}
+            for p in shuffled[:n_train]:
+                split_map[p] = "train"
+            for p in shuffled[n_train:n_train + n_val]:
+                split_map[p] = "val"
+            for p in shuffled[n_train + n_val:]:
+                split_map[p] = "test"
+
+            for split in ("train", "val", "test"):
+                os.makedirs(os.path.join(self.output_dir, split, "images"), exist_ok=True)
+                os.makedirs(os.path.join(self.output_dir, split, "labels"), exist_ok=True)
         else:
-            img_dir = os.path.join(self.output_dir, "images")
-            os.makedirs(img_dir, exist_ok=True)
+            split_map = {}
+            if mode in ("yolo", "yolo_obb"):
+                img_dir = os.path.join(self.output_dir, "images")
+                lbl_dir = os.path.join(self.output_dir, "labels")
+                os.makedirs(img_dir, exist_ok=True)
+                os.makedirs(lbl_dir, exist_ok=True)
+            else:
+                img_dir = os.path.join(self.output_dir, "images")
+                os.makedirs(img_dir, exist_ok=True)
 
         exported = 0
         errors = []
@@ -850,14 +905,23 @@ class ImageEditorApp(tk.Tk):
 
                 base = os.path.basename(path)
                 name, _ = os.path.splitext(base)
-                out_img = os.path.join(img_dir, name + ".jpg")
+
+                # Resolve destination directories
+                if use_split:
+                    split_name = split_map.get(path, "train")
+                    cur_img_dir = os.path.join(self.output_dir, split_name, "images")
+                    cur_lbl_dir = os.path.join(self.output_dir, split_name, "labels")
+                else:
+                    cur_img_dir = img_dir
+                    cur_lbl_dir = lbl_dir if mode in ("yolo", "yolo_obb") else img_dir
+
+                out_img = os.path.join(cur_img_dir, name + ".jpg")
                 img.save(out_img, "JPEG", quality=95)
 
                 # write YOLO / YOLO OBB labels
                 if mode in ("yolo", "yolo_obb") and path in self.annotations and self.annotations[path]:
                     iw_new, ih_new = img.size
-                    out_txt = os.path.join(lbl_dir, name + ".txt")
-                    # scale from annotation space (display dimensions) to exported dimensions
+                    out_txt = os.path.join(cur_lbl_dir, name + ".txt")
                     ann_w, ann_h = self.annotation_img_sizes.get(path, (iw_orig, ih_orig))
                     scale_x = iw_new / ann_w
                     scale_y = ih_new / ann_h
@@ -875,13 +939,11 @@ class ImageEditorApp(tk.Tk):
                             )
                             angle = ann.get("angle", 0.0)
                             if mode == "yolo_obb":
-                                # Always write 9-value OBB format
                                 corners = bbox_to_obb_corners(x1, y1, x2, y2, angle)
                                 coords = obb_corners_to_yolo(corners, iw_new, ih_new)
                                 f.write(f"{cls_idx} " + " ".join(f"{v:.6f}" for v in coords) + "\n")
                             else:
                                 if angle != 0.0:
-                                    # Mixed: write OBB format for rotated annotations
                                     corners = bbox_to_obb_corners(x1, y1, x2, y2, angle)
                                     coords = obb_corners_to_yolo(corners, iw_new, ih_new)
                                     f.write(f"{cls_idx} " + " ".join(f"{v:.6f}" for v in coords) + "\n")
@@ -893,16 +955,165 @@ class ImageEditorApp(tk.Tk):
             except Exception as exc:
                 errors.append(f"{os.path.basename(path)}: {exc}")
 
-        # write classes.txt
+        # write classes.txt and dataset.yaml for YOLO modes
         if mode in ("yolo", "yolo_obb"):
             with open(os.path.join(self.output_dir, "classes.txt"), "w") as f:
                 f.write("\n".join(self.class_list))
 
+            # Generate dataset.yaml (YOLOv8 format)
+            if use_split:
+                train_rel = "train/images"
+                val_rel = "val/images"
+                test_rel = "test/images"
+            else:
+                train_rel = "images"
+                val_rel = "images"
+                test_rel = "images"
+
+            yaml_lines = [
+                f"path: {os.path.abspath(self.output_dir)}",
+                f"train: {train_rel}",
+                f"val: {val_rel}",
+                f"test: {test_rel}",
+                f"nc: {len(self.class_list)}",
+                f"names: {self.class_list}",
+            ]
+            yaml_path = os.path.join(self.output_dir, "dataset.yaml")
+            with open(yaml_path, "w") as f:
+                f.write("\n".join(yaml_lines) + "\n")
+
         msg = f"Exported {exported} / {len(self.image_paths)} image(s) to:\n{self.output_dir}"
+        if use_split:
+            msg += f"\n\nSplit: train={self.split_train.get()}%  val={self.split_val.get()}%  test={self.split_test.get()}%"
+        if mode in ("yolo", "yolo_obb"):
+            msg += f"\n\ndataset.yaml written."
         if errors:
             msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:5])
         messagebox.showinfo("Export complete", msg)
         self.status_var.set(f"Batch export done → {self.output_dir}")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Auto-annotation
+    # ──────────────────────────────────────────────────────────────────────────
+    def _load_yolo_model(self, model_path: str):
+        """Load and return a YOLO model; raises ImportError if ultralytics missing."""
+        try:
+            from ultralytics import YOLO  # lazy import
+        except ImportError:
+            messagebox.showerror(
+                "Missing dependency",
+                "ultralytics is not installed.\nRun:  pip install ultralytics",
+            )
+            raise
+        return YOLO(model_path)
+
+    def auto_annotate(self):
+        """Run a pre-trained YOLO model on the current image and add detections."""
+        path = self._current_path()
+        if path is None:
+            messagebox.showwarning("No image", "Please load an image first.")
+            return
+
+        model_path = filedialog.askopenfilename(
+            title="Select YOLO Model (.pt)",
+            filetypes=[("YOLO model", "*.pt"), ("All files", "*.*")],
+        )
+        if not model_path:
+            return
+
+        try:
+            model = self._load_yolo_model(model_path)
+        except ImportError:
+            return
+        except Exception as exc:
+            messagebox.showerror("Model Error", f"Failed to load model:\n{exc}")
+            return
+
+        try:
+            results = model(path)
+            if path not in self.annotations:
+                self.annotations[path] = []
+
+            img = Image.open(path)
+            iw, ih = img.size
+            self.annotation_img_sizes[path] = (iw, ih)
+
+            count = 0
+            for result in results:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    cls_name = model.names[cls_id]
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    self.annotations[path].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
+                    if cls_name not in self.class_list:
+                        self.class_list.append(cls_name)
+                    count += 1
+
+            self.class_combo["values"] = self.class_list
+            self._update_box_listbox()
+            self._refresh_canvas()
+            self.status_var.set(f"Auto-annotated: {count} detection(s) on current image.")
+        except Exception as exc:
+            messagebox.showerror("Auto-Annotate Error", f"Inference failed:\n{exc}")
+
+    def auto_annotate_all(self):
+        """Run a pre-trained YOLO model on ALL loaded images (batch mode)."""
+        if not self.image_paths:
+            messagebox.showwarning("No images", "Please load images first.")
+            return
+
+        model_path = filedialog.askopenfilename(
+            title="Select YOLO Model (.pt)",
+            filetypes=[("YOLO model", "*.pt"), ("All files", "*.*")],
+        )
+        if not model_path:
+            return
+
+        try:
+            model = self._load_yolo_model(model_path)
+        except ImportError:
+            return
+        except Exception as exc:
+            messagebox.showerror("Model Error", f"Failed to load model:\n{exc}")
+            return
+
+        total = len(self.image_paths)
+        total_detections = 0
+        errors = []
+
+        for i, path in enumerate(self.image_paths):
+            self.status_var.set(f"Auto-annotating {i + 1}/{total}: {os.path.basename(path)} …")
+            self.update_idletasks()
+            try:
+                results = model(path)
+                if path not in self.annotations:
+                    self.annotations[path] = []
+
+                img = Image.open(path)
+                iw, ih = img.size
+                self.annotation_img_sizes[path] = (iw, ih)
+
+                for result in results:
+                    for box in result.boxes:
+                        cls_id = int(box.cls[0])
+                        cls_name = model.names[cls_id]
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        self.annotations[path].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
+                        if cls_name not in self.class_list:
+                            self.class_list.append(cls_name)
+                        total_detections += 1
+            except Exception as exc:
+                errors.append(f"{os.path.basename(path)}: {exc}")
+
+        self.class_combo["values"] = self.class_list
+        self._update_box_listbox()
+        self._refresh_canvas()
+
+        msg = f"Batch auto-annotation complete.\n{total} image(s) processed, {total_detections} detection(s) added."
+        if errors:
+            msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:5])
+        self.status_var.set(f"Auto-annotated {total} image(s) — {total_detections} total detection(s).")
+        messagebox.showinfo("Auto-Annotate All", msg)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
